@@ -1,11 +1,8 @@
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data"
-CACHE_DIR = DATA_DIR / "nflverse_cache"
-VS_TEAM_FILE = DATA_DIR / "vs_team.json"
+from fantasy_league.paths import DATA_DIR, NFLVERSE_CACHE_DIR, VS_TEAM_FILE, schedule_cache_file
+
 SEASONS = [2023, 2024, 2025]
 
 
@@ -14,17 +11,16 @@ def _configure() -> None:
 
     update_config(
         cache_mode="filesystem",
-        cache_dir=CACHE_DIR,
+        cache_dir=NFLVERSE_CACHE_DIR,
         cache_duration=3600 * 24 * 7,
         verbose=False,
     )
 
 
-def gsis_to_sleeper_map() -> Dict[str, str]:
+def gsis_to_sleeper_map() -> dict[str, str]:
     _configure()
-    import polars as pl
-
     import nflreadpy as nfl
+    import polars as pl
 
     ids = nfl.load_ff_playerids()
     df = (
@@ -35,12 +31,11 @@ def gsis_to_sleeper_map() -> Dict[str, str]:
     return {r["gsis_id"]: r["sleeper_id"] for r in df.to_dicts()}
 
 
-def build_vs_team(seasons: Optional[List[int]] = None) -> Dict[str, Any]:
+def build_vs_team(seasons: list[int] | None = None) -> dict[str, Any]:
     seasons = seasons or SEASONS
     _configure()
-    import polars as pl
-
     import nflreadpy as nfl
+    import polars as pl
 
     stats = nfl.load_player_stats(seasons, summary_level="week")
     grouped = (
@@ -55,7 +50,7 @@ def build_vs_team(seasons: Optional[List[int]] = None) -> Dict[str, Any]:
         )
     )
     id_map = gsis_to_sleeper_map()
-    vs: Dict[str, Any] = {}
+    vs: dict[str, Any] = {}
     for row in grouped.to_dicts():
         sleeper_id = id_map.get(row["player_id"])
         opp = row["opponent_team"]
@@ -71,18 +66,17 @@ def build_vs_team(seasons: Optional[List[int]] = None) -> Dict[str, Any]:
     return vs
 
 
-def load_vs_team() -> Dict[str, Any]:
+def load_vs_team() -> dict[str, Any]:
     if not VS_TEAM_FILE.exists():
         return {}
     return json.loads(VS_TEAM_FILE.read_text(encoding="utf-8"))
 
 
-def load_season_opponents(season: int) -> Dict[int, Dict[str, str]]:
-    cache_file = DATA_DIR / f"schedule_{season}.json"
+def load_season_opponents(season: int) -> dict[int, dict[str, str]]:
+    cache_file = schedule_cache_file(season)
     if cache_file.exists():
         return {int(k): v for k, v in json.loads(cache_file.read_text(encoding="utf-8")).items()}
     _configure()
-    import polars as pl
 
     import nflreadpy as nfl
 
@@ -90,7 +84,7 @@ def load_season_opponents(season: int) -> Dict[int, Dict[str, str]]:
         sched = nfl.load_schedules(season)
     except Exception:
         return {}
-    out: Dict[int, Dict[str, str]] = {}
+    out: dict[int, dict[str, str]] = {}
     if sched is None or len(sched) == 0:
         return out
     for row in sched.to_dicts():
@@ -108,5 +102,5 @@ def load_season_opponents(season: int) -> Dict[int, Dict[str, str]]:
     return out
 
 
-def load_opponents_by_week(season: int, week: int) -> Dict[str, str]:
+def load_opponents_by_week(season: int, week: int) -> dict[str, str]:
     return load_season_opponents(season).get(int(week), {})

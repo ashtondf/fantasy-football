@@ -2,5 +2,14 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# runtime data (generated, not source)
 data/
 sleeper_league_combined.json
+
+# build/test artifacts
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

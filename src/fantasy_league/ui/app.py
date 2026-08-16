@@ -1,36 +1,32 @@
 import json
-import sys
 from collections import Counter
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import pandas as pd
 import requests
 import streamlit as st
 
-SRC_DIR = Path(__file__).resolve().parent.parent
-REPO_ROOT = SRC_DIR.parent
-sys.path.insert(0, str(SRC_DIR))
-
-import pull_and_combine_data as sleeper  # noqa: E402
-import vs_team  # noqa: E402
-
-DATA_DIR = REPO_ROOT / "data"
-COMBINED_FILE = DATA_DIR / "sleeper_league_combined.json"
-PLAYERS_CACHE = DATA_DIR / "players_nfl.json"
-VS_TEAM_FILE = DATA_DIR / "vs_team.json"
+from fantasy_league import sleeper, vs_team
+from fantasy_league.analysis import (
+    WAIVER_POSITIONS,
+    build_player_rows,
+    player_name,
+    projection_for,
+    recommend,
+)
+from fantasy_league.paths import COMBINED_FILE, PLAYERS_CACHE, VS_TEAM_FILE
 
 BASE = "https://api.sleeper.app/v1"
 
 
-def load_combined() -> Dict[str, Any]:
+def load_combined() -> dict[str, Any]:
     if not COMBINED_FILE.exists():
         return {}
     with open(COMBINED_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 
-def fetch_combined(league_id: str, week: Optional[int] = None) -> Dict[str, Any]:
+def fetch_combined(league_id: str, week: int | None = None) -> dict[str, Any]:
     combined = sleeper.combine_league_data(league_id, analysis_week=week)
     COMBINED_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(COMBINED_FILE, "w", encoding="utf-8") as f:
@@ -38,7 +34,7 @@ def fetch_combined(league_id: str, week: Optional[int] = None) -> Dict[str, Any]
     return combined
 
 
-def fetch_player_map() -> Dict[str, Any]:
+def fetch_player_map() -> dict[str, Any]:
     if PLAYERS_CACHE.exists():
         with open(PLAYERS_CACHE, encoding="utf-8") as f:
             return json.load(f)
@@ -53,16 +49,11 @@ def fetch_player_map() -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False)
-def get_player_map() -> Dict[str, Any]:
+def get_player_map() -> dict[str, Any]:
     return fetch_player_map()
 
 
-def player_name(pid: str, players: Dict[str, Any]) -> str:
-    p = players.get(pid, {})
-    return p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or pid
-
-
-def player_label(pid: str, players: Dict[str, Any]) -> str:
+def player_label(pid: str, players: dict[str, Any]) -> str:
     p = players.get(pid, {})
     name = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or pid
     pos = p.get("position", "?")
@@ -70,7 +61,7 @@ def player_label(pid: str, players: Dict[str, Any]) -> str:
     return f"{name} ({pos}, {team})"
 
 
-def roster_team_name(roster_id: int, combined: Dict[str, Any]) -> str:
+def roster_team_name(roster_id: int, combined: dict[str, Any]) -> str:
     rosters = {r["roster_id"]: r for r in combined.get("rosters", [])}
     users = {u["user_id"]: u for u in combined.get("users", [])}
     r = rosters.get(roster_id)
@@ -80,105 +71,20 @@ def roster_team_name(roster_id: int, combined: Dict[str, Any]) -> str:
     return (u.get("metadata") or {}).get("team_name") or (u or {}).get("display_name") or f"Roster {roster_id}"
 
 
-def user_avatar(user: Dict[str, Any], thumb: bool = True) -> Optional[str]:
+def user_avatar(user: dict[str, Any], thumb: bool = True) -> str | None:
     av = (user or {}).get("avatar")
     if not av:
         return None
     return f"https://sleepercdn.com/avatars/{'thumbs/' if thumb else ''}{av}"
 
 
-def projection_for(pid: str, combined: Dict[str, Any]) -> Optional[float]:
-    entry = combined.get("projections", {}).get(pid)
-    if not entry:
-        return None
-    val = (entry.get("stats") or {}).get("pts_half_ppr")
-    return float(val) if val is not None else None
+def _diff_text(my_total: float, opp_total: float) -> str:
+    if opp_total > my_total:
+        return f"behind by {opp_total - my_total:.1f}"
+    return f"ahead by {my_total - opp_total:.1f}"
 
 
-def build_player_rows(
-    pids: List[str],
-    starters: set,
-    players: Dict[str, Any],
-    combined: Dict[str, Any],
-    opp_map: Dict[str, str],
-    vs: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    rows = []
-    for pid in pids:
-        p = players.get(pid, {})
-        team = p.get("team")
-        pos = p.get("position")
-        opp = opp_map.get(team) if team else None
-        hist = vs.get(pid, {}).get(opp) if opp else None
-        proj = projection_for(pid, combined)
-        vs_avg = None
-        if hist:
-            vs_avg = hist.get("avg")
-        if proj is None and vs_avg is not None:
-            blended = vs_avg
-        elif vs_avg is None and proj is not None:
-            blended = proj
-        elif proj is None:
-            blended = None
-        else:
-            blended = 0.7 * float(proj) + 0.3 * float(vs_avg)
-        rows.append({
-            "pid": pid,
-            "name": player_name(pid, players),
-            "pos": pos,
-            "team": team,
-            "opp": opp,
-            "proj": float(proj) if proj is not None else None,
-            "vs_avg": float(vs_avg) if vs_avg is not None else None,
-            "vs_games": hist.get("games") if hist else None,
-            "blended": float(blended) if blended is not None else None,
-            "starter": pid in starters,
-        })
-    return rows
-
-
-def recommend(rows: List[Dict[str, Any]], roster_positions: List[str]) -> List[Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]]:
-    slots = Counter(p for p in roster_positions if p not in ("BN", "IR", "RES", "TAXI"))
-    flex_count = slots.pop("FLEX", 0)
-    sf_count = slots.pop("SUPER_FLEX", 0)
-    pool = sorted(rows, key=lambda r: (r["blended"] if r["blended"] is not None else float("-inf")), reverse=True)
-    chosen = set()
-    result: List[Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]] = []
-
-    def pick(cands: List[Dict[str, Any]]) -> Dict[str, Any]:
-        picked = cands[0]
-        chosen.add(picked["pid"])
-        return picked
-
-    for pos, cnt in slots.items():
-        cands = [r for r in pool if r["pos"] == pos and r["pid"] not in chosen]
-        for _ in range(cnt):
-            if not cands:
-                break
-            cur = pick(cands)
-            cands = cands[1:]
-            alt = next((r for r in cands if r["pos"] == pos), None)
-            result.append((pos, cur, alt))
-    if flex_count:
-        cands = [r for r in pool if r["pos"] in ("RB", "WR", "TE") and r["pid"] not in chosen]
-        for _ in range(flex_count):
-            if not cands:
-                break
-            cur = pick(cands)
-            cands = cands[1:]
-            result.append(("FLEX", cur, cands[0] if cands else None))
-    if sf_count:
-        cands = [r for r in pool if r["pos"] in ("QB", "RB", "WR", "TE") and r["pid"] not in chosen]
-        for _ in range(sf_count):
-            if not cands:
-                break
-            cur = pick(cands)
-            cands = cands[1:]
-            result.append(("SUPER_FLEX", cur, cands[0] if cands else None))
-    return result
-
-
-def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
+def render_my_team(combined: dict[str, Any], my_name: str) -> None:
     users = combined.get("users", [])
     my_user = next((u for u in users if u.get("display_name") == my_name), None)
     if not my_user:
@@ -197,7 +103,12 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
     opp_roster = opp_user = opp_matchup = None
     if my_matchup:
         opp_matchup = next(
-            (m for m in matchups if m.get("matchup_id") == my_matchup.get("matchup_id") and m.get("roster_id") != my_roster.get("roster_id")),
+            (
+                m
+                for m in matchups
+                if m.get("matchup_id") == my_matchup.get("matchup_id")
+                and m.get("roster_id") != my_roster.get("roster_id")
+            ),
             None,
         )
         if opp_matchup:
@@ -205,7 +116,8 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
             opp_user = next((u for u in users if u.get("user_id") == (opp_roster or {}).get("owner_id")), None)
     opp_team_name = (
         (opp_user.get("metadata") or {}).get("team_name") or opp_user.get("display_name", "Unknown")
-        if opp_user else "Bye / no matchup"
+        if opp_user
+        else "Bye / no matchup"
     )
 
     hcol_a, hcol_b = st.columns([1, 1])
@@ -231,10 +143,13 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
     rec_by_pid = {r["pid"]: slot for slot, r, _ in rec}
 
     opp_starters = set(opp_matchup.get("starters", [])) if opp_matchup else set()
-    opp_rows = build_player_rows((opp_roster or {}).get("players", []), opp_starters, players, combined, {}, vs) if opp_roster else []
+    opp_rows = (
+        build_player_rows((opp_roster or {}).get("players", []), opp_starters, players, combined, {}, vs)
+        if opp_roster
+        else []
+    )
     opp_starter_rows = [r for r in opp_rows if r["starter"]]
 
-    proj_sum = lambda rows_: sum(r["proj"] or 0 for r in rows_)  # noqa: E731
     my_proj_total = sum((projection_for(r["pid"], combined) or 0) for _, r, _ in rec)
     opp_proj_total = sum(r["proj"] or 0 for r in opp_starter_rows)
 
@@ -244,24 +159,28 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
     c3.metric("Week", week or "—")
     c4.metric("Projected", f"{my_proj_total:.1f} pts")
 
-    st.markdown(f"**Projected total vs opponent:** {my_proj_total:.1f} — {opp_proj_total:.1f} "
-                f"({('behind by %.1f' % (opp_proj_total - my_proj_total)) if opp_proj_total > my_proj_total else 'ahead by %.1f' % (my_proj_total - opp_proj_total)})")
+    st.markdown(
+        f"**Projected total vs opponent:** {my_proj_total:.1f} — {opp_proj_total:.1f} "
+        f"({_diff_text(my_proj_total, opp_proj_total)})"
+    )
 
     # Recommended lineup table
     disp = []
     for slot, r, alt in rec:
         vs_txt = f"{r['vs_avg']:.1f} ({r['vs_games']}g)" if r["vs_avg"] is not None else "—"
-        disp.append({
-            "Slot": slot,
-            "Player": r["name"],
-            "Pos": r["pos"],
-            "Team": r["team"],
-            "Opp DEF": r["opp"] or "—",
-            "Proj": r["proj"],
-            "vs Opp avg": vs_txt,
-            "Blended": round(r["blended"], 1) if r["blended"] is not None else None,
-            "Currently starting": "Yes" if r["starter"] else "No",
-        })
+        disp.append(
+            {
+                "Slot": slot,
+                "Player": r["name"],
+                "Pos": r["pos"],
+                "Team": r["team"],
+                "Opp DEF": r["opp"] or "—",
+                "Proj": r["proj"],
+                "vs Opp avg": vs_txt,
+                "Blended": round(r["blended"], 1) if r["blended"] is not None else None,
+                "Currently starting": "Yes" if r["starter"] else "No",
+            }
+        )
     st.subheader(f"Recommended lineup (Week {week})")
     st.dataframe(pd.DataFrame(disp), hide_index=True, width="stretch")
 
@@ -269,15 +188,21 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
     suggestions = []
     for slot, r, alt in rec:
         if not r["starter"]:
-            reasoning = f"**Start {r['name']} ({r['pos']})** — projected {r['proj']:.1f}" if r["proj"] is not None else f"**Start {r['name']} ({r['pos']})**"
+            if r["proj"] is not None:
+                reasoning = f"**Start {r['name']} ({r['pos']})** — projected {r['proj']:.1f}"
+            else:
+                reasoning = f"**Start {r['name']} ({r['pos']})**"
             if r["vs_avg"] is not None:
                 reasoning += f", avg {r['vs_avg']:.1f} vs {r['opp']} ({r['vs_games']} games)"
             if alt and alt["blended"] is not None and r["blended"] is not None:
                 reasoning += f". Next best: {alt['name']} ({r['blended'] - alt['blended']:.1f} pts better)."
             suggestions.append((reasoning, r, 0))
         elif alt and alt["blended"] is not None and r["blended"] is not None and alt["blended"] > r["blended"] + 0.5:
-            suggestions.append((f"**Consider swapping {alt['name']} ({alt['pos']}) into {slot}** over {r['name']} "
-                                f"(blended {alt['blended']:.1f} vs {r['blended']:.1f}).", r, alt["blended"] - r["blended"]))
+            suggestion = (
+                f"**Consider swapping {alt['name']} ({alt['pos']}) into {slot}** over {r['name']} "
+                f"(blended {alt['blended']:.1f} vs {r['blended']:.1f})."
+            )
+            suggestions.append((suggestion, r, alt["blended"] - r["blended"]))
     for r in my_rows:
         if r["starter"] and r["pid"] not in rec_by_pid:
             suggestions.append((f"**Bench {r['name']} ({r['pos']})** — not in the recommended lineup this week.", r, 0))
@@ -293,23 +218,39 @@ def render_my_team(combined: Dict[str, Any], my_name: str) -> None:
     # Roster detail expanders
     with st.expander(f"Opponent: {opp_team_name} — roster"):
         if opp_starter_rows:
-            odf = pd.DataFrame([{
-                "Player": r["name"], "Pos": r["pos"], "Team": r["team"], "Proj": r["proj"],
-            } for r in opp_starter_rows])
+            odf = pd.DataFrame(
+                [
+                    {
+                        "Player": r["name"],
+                        "Pos": r["pos"],
+                        "Team": r["team"],
+                        "Proj": r["proj"],
+                    }
+                    for r in opp_starter_rows
+                ]
+            )
             st.dataframe(odf, hide_index=True, width="stretch")
         if opp_rows:
             st.write("Bench:")
-            st.write("\n".join(f"{r['name']} ({r['pos']}, {r['team']}) — {r['proj']:.1f}" if r['proj'] is not None else f"{r['name']} ({r['pos']}, {r['team']})" for r in opp_rows if not r["starter"]))
+            bench_lines = []
+            for r in opp_rows:
+                if r["starter"]:
+                    continue
+                base = f"{r['name']} ({r['pos']}, {r['team']})"
+                bench_lines.append(f"{base} — {r['proj']:.1f}" if r["proj"] is not None else base)
+            st.write("\n".join(bench_lines))
 
     with st.expander("My full roster"):
         for r in sorted(my_rows, key=lambda x: (x["pos"] or "", -(x["blended"] or 0))):
             mark = "**START**" if r["pid"] in rec_by_pid else "bench"
-            st.write(f"{mark} — {r['name']} ({r['pos']}, {r['team']})"
-                     + (f" proj {r['proj']:.1f}" if r["proj"] is not None else "")
-                     + (f" vs {r['opp']} avg {r['vs_avg']:.1f}/{r['vs_games']}g" if r["vs_avg"] is not None else ""))
+            st.write(
+                f"{mark} — {r['name']} ({r['pos']}, {r['team']})"
+                + (f" proj {r['proj']:.1f}" if r["proj"] is not None else "")
+                + (f" vs {r['opp']} avg {r['vs_avg']:.1f}/{r['vs_games']}g" if r["vs_avg"] is not None else "")
+            )
 
 
-def roster_record(r: Dict[str, Any], combined: Dict[str, Any], players: Dict[str, Any]) -> Dict[str, Any]:
+def roster_record(r: dict[str, Any], combined: dict[str, Any], players: dict[str, Any]) -> dict[str, Any]:
     users = {u["user_id"]: u for u in combined.get("users", [])}
     owner = r.get("owner", {}) or {}
     user = users.get(r.get("owner_id"))
@@ -331,10 +272,7 @@ def roster_record(r: Dict[str, Any], combined: Dict[str, Any], players: Dict[str
     }
 
 
-WAIVER_POSITIONS = ("QB", "RB", "WR", "TE")
-
-
-def render_waiver(combined: Dict[str, Any], my_name: str) -> None:
+def render_waiver(combined: dict[str, Any], my_name: str) -> None:
     players = get_player_map()
     owned: set = set()
     for r in combined.get("rosters", []):
@@ -374,7 +312,7 @@ def render_waiver(combined: Dict[str, Any], my_name: str) -> None:
         key=lambda r: r["blended"] if r["blended"] is not None else -1.0,
     )
 
-    free_agents: List[Tuple[str, Dict[str, Any], float]] = []
+    free_agents: list[tuple[str, dict[str, Any], float]] = []
     for pid, p in players.items():
         if pid in owned:
             continue
@@ -411,13 +349,15 @@ def render_waiver(combined: Dict[str, Any], my_name: str) -> None:
         pos = p.get("position")
         if filt != "All" and pos != filt:
             continue
-        rows.append({
-            "Player": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or pid,
-            "Pos": pos,
-            "Team": p.get("team", "FA"),
-            "Proj": proj,
-            "My need": need_txt.get(pos, "ok"),
-        })
+        rows.append(
+            {
+                "Player": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or pid,
+                "Pos": pos,
+                "Team": p.get("team", "FA"),
+                "Proj": proj,
+                "My need": need_txt.get(pos, "ok"),
+            }
+        )
     st.subheader("Top available players")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
@@ -450,14 +390,14 @@ def render_waiver(combined: Dict[str, Any], my_name: str) -> None:
         st.write("\n".join(f"{r['name']} ({r['pos']}, {r['team']})" for r in bench))
 
 
-def render_draft(combined: Dict[str, Any]) -> None:
+def render_draft(combined: dict[str, Any]) -> None:
     st.subheader("Future draft picks by team")
     traded = combined.get("traded_picks", [])
     if not traded:
         st.info("No traded-pick data loaded.")
     else:
-        owned: Dict[int, list] = {}
-        sent: Dict[int, list] = {}
+        owned: dict[int, list] = {}
+        sent: dict[int, list] = {}
         for p in traded:
             season, rnd = p.get("season"), p.get("round")
             owned.setdefault(p.get("owner_id"), []).append((season, rnd))
@@ -467,12 +407,14 @@ def render_draft(combined: Dict[str, Any]) -> None:
             rid = r["roster_id"]
             o = ", ".join(f"{s} R{rnd}" for s, rnd in sorted(owned.get(rid, []), key=lambda x: (x[0], x[1]))) or "—"
             s = ", ".join(f"{s} R{rnd}" for s, rnd in sorted(sent.get(rid, []), key=lambda x: (x[0], x[1]))) or "—"
-            rows.append({
-                "Team": roster_team_name(rid, combined),
-                "Picks owned": o,
-                "Own picks sent away": s,
-                "Net picks": len(owned.get(rid, [])) - len(sent.get(rid, [])),
-            })
+            rows.append(
+                {
+                    "Team": roster_team_name(rid, combined),
+                    "Picks owned": o,
+                    "Own picks sent away": s,
+                    "Net picks": len(owned.get(rid, [])) - len(sent.get(rid, [])),
+                }
+            )
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
     drafts = combined.get("drafts", [])
@@ -481,7 +423,8 @@ def render_draft(combined: Dict[str, Any]) -> None:
         st.info("No draft data loaded.")
         return
     for d in drafts:
-        st.caption(f"{d.get('metadata', {}).get('name') or 'Draft'} — {d.get('season')} {d.get('type')} ({d.get('status')})")
+        meta = d.get("metadata", {}) or {}
+        st.caption(f"{meta.get('name') or 'Draft'} — {d.get('season')} {d.get('type')} ({d.get('status')})")
     picks = combined.get("draft_picks", [])
     if picks:
         players = get_player_map()
@@ -492,16 +435,18 @@ def render_draft(combined: Dict[str, Any]) -> None:
                 rid = int(rid)
             except (TypeError, ValueError):
                 rid = 0
-            rows.append({
-                "Pick": p.get("pick_no"),
-                "Round": p.get("round"),
-                "Player": player_name(p.get("player_id", ""), players),
-                "Team": roster_team_name(rid, combined),
-            })
+            rows.append(
+                {
+                    "Pick": p.get("pick_no"),
+                    "Round": p.get("round"),
+                    "Player": player_name(p.get("player_id", ""), players),
+                    "Team": roster_team_name(rid, combined),
+                }
+            )
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
-def render_activity(combined: Dict[str, Any]) -> None:
+def render_activity(combined: dict[str, Any]) -> None:
     txs = combined.get("transactions", [])
     if not txs:
         st.info("No transactions loaded for this week.")
@@ -513,19 +458,21 @@ def render_activity(combined: Dict[str, Any]) -> None:
         adds = ", ".join(player_name(pid, players) for pid in (tx.get("adds") or {}))
         drops = ", ".join(player_name(pid, players) for pid in (tx.get("drops") or {}))
         bid = (tx.get("settings") or {}).get("waiver_bid")
-        rows.append({
-            "Type": tx.get("type"),
-            "Week": tx.get("leg"),
-            "Teams": teams,
-            "Adds": adds or "—",
-            "Drops": drops or "—",
-            "FAAB": f"${bid}" if bid is not None else "—",
-        })
+        rows.append(
+            {
+                "Type": tx.get("type"),
+                "Week": tx.get("leg"),
+                "Teams": teams,
+                "Adds": adds or "—",
+                "Drops": drops or "—",
+                "FAAB": f"${bid}" if bid is not None else "—",
+            }
+        )
     df = pd.DataFrame(rows)
     st.dataframe(df, hide_index=True, width="stretch")
 
 
-def render_overview(combined: Dict[str, Any]) -> None:
+def render_overview(combined: dict[str, Any]) -> None:
     league = combined.get("league", {})
     rosters = combined.get("rosters", [])
     users = combined.get("users", [])
@@ -555,22 +502,26 @@ def render_overview(combined: Dict[str, Any]) -> None:
         with st.expander("Playoff bracket (winners)"):
             rows = []
             for m in bracket:
+
                 def label(x):
                     if x:
                         return roster_team_name(x, combined)
                     frm = m.get("t1_from") or m.get("t2_from") or {}
                     return f"{'W' if 'w' in frm else 'L'}{frm.get('w') or frm.get('l')}" if frm else "TBD"
-                rows.append({
-                    "Round": m.get("r"),
-                    "Match": m.get("m"),
-                    "Team 1": label(m.get("t1")),
-                    "Team 2": label(m.get("t2")),
-                    "Winner": roster_team_name(m["w"], combined) if m.get("w") else "—",
-                })
+
+                rows.append(
+                    {
+                        "Round": m.get("r"),
+                        "Match": m.get("m"),
+                        "Team 1": label(m.get("t1")),
+                        "Team 2": label(m.get("t2")),
+                        "Winner": roster_team_name(m["w"], combined) if m.get("w") else "—",
+                    }
+                )
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
-def render_rosters(combined: Dict[str, Any]) -> None:
+def render_rosters(combined: dict[str, Any]) -> None:
     rosters = combined.get("rosters", [])
     if not rosters:
         st.warning("No roster data loaded.")
@@ -581,7 +532,8 @@ def render_rosters(combined: Dict[str, Any]) -> None:
     divisions = set()
     for r in rosters:
         num = (r.get("settings", {}) or {}).get("division")
-        label = (combined.get("league", {}).get("metadata", {}) or {}).get(f"division_{num}", f"Division {num}" if num else "All")
+        meta = combined.get("league", {}).get("metadata", {}) or {}
+        label = meta.get(f"division_{num}", f"Division {num}" if num else "All")
         divisions.add(label)
     options = ["All"] + sorted(divisions, key=lambda d: (d == "All", d))
     filter_div = st.selectbox("Filter by division", options)
@@ -605,21 +557,23 @@ def render_rosters(combined: Dict[str, Any]) -> None:
             st.write("\n".join(rec["_player_list"]))
 
 
-def render_trending(combined: Dict[str, Any]) -> None:
+def render_trending(combined: dict[str, Any]) -> None:
     players = get_player_map()
 
-    def table(items: List[Dict[str, Any]]) -> pd.DataFrame:
+    def table(items: list[dict[str, Any]]) -> pd.DataFrame:
         rows = []
         for item in items:
             pid = item.get("player_id")
             p = players.get(pid, {})
             name = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or pid
-            rows.append({
-                "Player": name,
-                "Position": p.get("position", "?"),
-                "Team": p.get("team", "FA"),
-                "Count (24h)": item.get("count", 0),
-            })
+            rows.append(
+                {
+                    "Player": name,
+                    "Position": p.get("position", "?"),
+                    "Team": p.get("team", "FA"),
+                    "Count (24h)": item.get("count", 0),
+                }
+            )
         return pd.DataFrame(rows).sort_values("Count (24h)", ascending=False)
 
     adds = combined.get("trending_players_add_sample", [])
