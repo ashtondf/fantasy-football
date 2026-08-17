@@ -1,0 +1,16 @@
+.git
+.venv
+data
+*.egg-info
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+documentation
+Dockerfile
+docker-compose.yml
+.gitignore
+Makefile
+run-ui.sh
+.dockerignore

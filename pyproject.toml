@@ -13,6 +13,7 @@ authors = [{ name = "Ash" }]
 dependencies = [
     "nflreadpy>=0.1",
     "pandas>=2.0",
+    "polars>=1.0",
     "requests>=2.31",
     "streamlit>=1.30",
 ]
