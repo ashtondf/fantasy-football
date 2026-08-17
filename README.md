@@ -167,3 +167,6 @@ src/fantasy_league/
 └── ui/app.py        # Streamlit front-end
 tests/               # pytest suite
 ```
+
+For maintainers: see [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow
+(patching, linting, testing, image build/verify, and Docker Hub publishing).
